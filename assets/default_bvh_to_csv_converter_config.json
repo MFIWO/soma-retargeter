@@ -1,9 +1,9 @@
 {
-	"import_folder": "assets/motions/bvh",
-	"export_folder": "assets/motions/test-export",
-	"batch_size": 100,
-	"retargeter": "Newton",
-	"retarget_source": "soma",
-	"retarget_target": "unitree_g1",
-	"retarget_source_facing_direction": "Mujoco"
+    "import_folder": "/root/Downloads/GR00T-WholeBodyControl/bones-seed-extracted/soma_uniform/bvh/",
+    "export_folder": "/root/Downloads/GR00T-WholeBodyControl/bones-seed-extracted/soma_uniform/h2_csv_extracted/",
+    "batch_size": 512, 
+    "retargeter": "Newton",
+    "retarget_source": "soma",
+    "retarget_target": "h2",
+    "retarget_source_facing_direction": "Mujoco"
 }
