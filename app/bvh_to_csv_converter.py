@@ -410,14 +410,32 @@ class Viewer:
             export_path.mkdir(parents=True, exist_ok=True)
 
         batch_size = self.config['batch_size']
-        bvh_files = list(import_path.rglob("*.bvh"))
-        if (len(bvh_files) == 0):
+        all_bvh_files = list(import_path.rglob("*.bvh"))
+        if (len(all_bvh_files) == 0):
             print(f"[ERROR]: Import folder {str(import_path)}, does not contain any BVH files.")
             exit(-1)
 
+        pending_bvh_files = []
+        skipped_existing = 0
+        for file_path in all_bvh_files:
+            dst_path = export_path / file_path.relative_to(import_path).with_suffix(".csv")
+            if dst_path.is_file():
+                skipped_existing += 1
+                continue
+            pending_bvh_files.append(file_path)
+
+        print(f"[INFO]: Found {len(all_bvh_files)} BVH files in total.")
+        print(f"[INFO]: Skipping {skipped_existing} motions with existing CSV outputs.")
+
+        if len(pending_bvh_files) == 0:
+            print("[INFO]: No pending BVH files to retarget. Export folder is already up to date.")
+            return
+
+        print(f"[INFO]: Retargeting {len(pending_bvh_files)} pending motions.")
+
         # Sort files based on size (largest first)
-        bvh_files.sort(key=lambda p: p.stat().st_size, reverse=True)
-        batches = [bvh_files[i:i + batch_size] for i in range(0, len(bvh_files), batch_size)]
+        pending_bvh_files.sort(key=lambda p: p.stat().st_size, reverse=True)
+        batches = [pending_bvh_files[i:i + batch_size] for i in range(0, len(pending_bvh_files), batch_size)]
         
         # All skeletons should be the same, load one as our reference
         bvh_importer = bvh_utils.BVHImporter()
@@ -442,7 +460,25 @@ class Viewer:
 
         for i, batch in enumerate(batches):
             print(f"[INFO]: Processing batch {i+1} of {len(batches)}")
-            
+            fresh_batch = []
+            for file_path in batch:
+                dst_path = export_path / file_path.relative_to(import_path).with_suffix(".csv")
+                if dst_path.is_file():
+                    continue
+                fresh_batch.append(file_path)
+
+            if len(fresh_batch) == 0:
+                print(f"[INFO]: Skipping batch {i+1}/{len(batches)} because all CSV outputs already exist.")
+                continue
+
+            if len(fresh_batch) != len(batch):
+                print(
+                    f"[INFO]: Batch {i+1}/{len(batches)}: "
+                    f"skipping {len(batch) - len(fresh_batch)} existing outputs, "
+                    f"retargeting {len(fresh_batch)} files."
+                )
+
+            batch = fresh_batch
             print(f"[INFO]: Loading {len(batch)} animations...")
             animations = []
             for file_path in batch:
@@ -477,6 +513,7 @@ class Viewer:
             f"[INFO]: Retargeted {nb_retargeted_motions} animations successfully "
             f"in {elapsed_str} "
             f"[{(elapsed_time/nb_retargeted_motions):.2f}s per motion]!")
+        print(f"[INFO]: Resume summary: total={len(all_bvh_files)}, skipped_existing={skipped_existing}, newly_exported={nb_retargeted_motions}.")
 
 def main():
     import newton.examples
