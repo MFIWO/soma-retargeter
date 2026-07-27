@@ -11,7 +11,7 @@ import soma_retargeter.assets.bvh as bvh_utils
 import soma_retargeter.utils.newton_utils as newton_utils
 import soma_retargeter.utils.io_utils as io_utils
 import soma_retargeter.pipelines.utils as pipeline_utils
-from soma_retargeter.pipelines.ik_objectives import IKSmoothJointFilter
+from soma_retargeter.pipelines.ik_objectives import IKSmoothJointFilter, IKJointPosePreference
 from soma_retargeter.animation.skeleton import Skeleton, SkeletonInstance
 from soma_retargeter.animation.animation_buffer import AnimationBuffer
 from soma_retargeter.robotics.human_to_robot_scaler import HumanToRobotScaler
@@ -68,6 +68,13 @@ class NewtonPipeline:
         self.enable_self_penetration = False
         self.smooth_joint_filter_coord_masks = None
         self.joint_limit_clamper = None
+        self.default_joint_pose = retargeter_config.get('default_joint_pose', {})
+        self.default_joint_pose_body_map = retargeter_config.get('default_joint_pose_body_map', {})
+        self.joint_delta_limits = retargeter_config.get('joint_delta_limits', {})
+        self.joint_delta_limit_body_map = retargeter_config.get('joint_delta_limit_body_map', {})
+        self.preferred_joint_pose = retargeter_config.get('preferred_joint_pose', {})
+        self.preferred_joint_pose_body_map = retargeter_config.get('preferred_joint_pose_body_map', {})
+        self.preferred_joint_pose_weight = retargeter_config.get('preferred_joint_pose_weight', 0.0)
 
         self.robot_builder = newton.ModelBuilder()
         self.robot_builder.add_mjcf(pipeline_utils.get_robot_mjcf_path(self.target_type))
@@ -93,6 +100,13 @@ class NewtonPipeline:
         if smooth_joint_filter_objective_body_masks is not None:
             self.smooth_joint_filter_coord_masks = newton_utils.create_joint_coord_masks(
                 self.ik_model, smooth_joint_filter_objective_body_masks, 0.0)
+        self.preferred_joint_pose_target = None
+        self.preferred_joint_pose_coord_masks = None
+        if self.preferred_joint_pose and self.preferred_joint_pose_weight > 0.0:
+            (
+                self.preferred_joint_pose_target,
+                self.preferred_joint_pose_coord_masks
+            ) = self._build_preferred_joint_pose_arrays()
 
         effector_names = self.human_robot_scaler.effector_names()
         self.target_effector_indices = [effector_names.index(name) for name in self.mapped_joints]
@@ -180,8 +194,12 @@ class NewtonPipeline:
         print(f"[INFO]\t  IK Solver Iterations: {self.ik_iterations}")
         print(f"[INFO]\t  Joint Limit Objective Weight: {self.joint_limit_weight}")
         print(f"[INFO]\t  Smooth Joint Filter Objective Weight: {self.smooth_joint_filter_weight}")
+        print(f"[INFO]\t  Default Joint Pose Entries: {len(self.default_joint_pose)}")
+        print(f"[INFO]\t  Joint Delta Limit Entries: {len(self.joint_delta_limits)}")
+        print(f"[INFO]\t  Preferred Joint Pose Entries: {len(self.preferred_joint_pose)}")
 
         model = self._build_model(num_envs)
+        self._apply_default_joint_pose(model, num_envs)
         state = model.state()
 
         if self.post_processing_enabled:
@@ -192,7 +210,8 @@ class NewtonPipeline:
             position_objectives,
             rotation_objectives,
             joint_limit_objective,
-            smooth_joint_filter_objective
+            smooth_joint_filter_objective,
+            preferred_joint_pose_objective
         ) = self._create_ik_objectives(num_envs, model, state)
 
         # Add optional objectives
@@ -201,6 +220,8 @@ class NewtonPipeline:
             ik_solver_active_objectives.append(joint_limit_objective)
         if self.smooth_joint_filter_weight > 0.0:
             ik_solver_active_objectives.append(smooth_joint_filter_objective)
+        if preferred_joint_pose_objective is not None:
+            ik_solver_active_objectives.append(preferred_joint_pose_objective)
 
         ik_solver = ik.IKSolver(
             model=self.ik_model,
@@ -229,6 +250,7 @@ class NewtonPipeline:
 
         #import time
         num_frames_to_remove = self.num_initialization_frames + self.num_stabilization_frames
+        prev_joint_q_np = joint_q.numpy().copy()
         joint_q_data = [np.full((len(self.input_targets[i]),), None) for i in range(num_envs)]
         for frame in trange(self.max_frames, desc="[INFO] Retargeting Motions"):
             if frame <= num_frames_to_remove:
@@ -247,6 +269,8 @@ class NewtonPipeline:
                 wp.capture_launch(graph_capture)
             else:
                 single_step()
+
+            prev_joint_q_np = self._apply_joint_delta_limits(joint_q, prev_joint_q_np, model, num_envs)
 
             data = None
             if self.post_processing_enabled:
@@ -286,6 +310,60 @@ class NewtonPipeline:
 
         return model
 
+    def _apply_default_joint_pose(self, model, num_envs: int):
+        newton_utils.apply_default_joint_pose(
+            model,
+            self.robot_builder,
+            self.default_joint_pose,
+            self.default_joint_pose_body_map,
+            num_envs)
+
+    def _apply_joint_delta_limits(self, joint_q, prev_joint_q_np, model, num_envs: int):
+        if not self.joint_delta_limits:
+            return joint_q.numpy().copy()
+
+        joint_q_np = joint_q.numpy().copy()
+        joint_q_start_np = model.joint_q_start.numpy()
+        joint_dof_dim_np = model.joint_dof_dim.numpy()
+        base_body_names = [newton_utils.get_name_from_label(label) for label in self.robot_builder.body_label]
+        base_body_name_to_idx = {name: idx for idx, name in enumerate(base_body_names)}
+
+        for limit_name, max_delta in self.joint_delta_limits.items():
+            body_name = self.joint_delta_limit_body_map.get(limit_name, limit_name)
+            if body_name not in base_body_name_to_idx:
+                raise ValueError(
+                    f"[ERROR]: Joint delta limit entry '{limit_name}' maps to unknown body '{body_name}'.")
+
+            body_idx = base_body_name_to_idx[body_name]
+            for env in range(num_envs):
+                model_body_idx = env * self.num_body_count + body_idx
+                coord_start = int(joint_q_start_np[model_body_idx])
+                lin_dim, ang_dim = joint_dof_dim_np[model_body_idx]
+                coord_dim = int(lin_dim + ang_dim)
+                if coord_dim != 1:
+                    raise ValueError(
+                        f"[ERROR]: Joint delta limit entry '{limit_name}' maps to body '{body_name}' "
+                        f"with {coord_dim} coordinates; only 1-DoF joints are supported.")
+
+                if joint_q_np.ndim == 1:
+                    prev_value = prev_joint_q_np[coord_start]
+                    joint_q_np[coord_start] = np.clip(
+                        joint_q_np[coord_start],
+                        prev_value - max_delta,
+                        prev_value + max_delta)
+                elif joint_q_np.ndim == 2:
+                    coord_start = coord_start % joint_q_np.shape[1]
+                    prev_value = prev_joint_q_np[env, coord_start]
+                    joint_q_np[env, coord_start] = np.clip(
+                        joint_q_np[env, coord_start],
+                        prev_value - max_delta,
+                        prev_value + max_delta)
+                else:
+                    raise ValueError(f"[ERROR]: Unsupported joint_q shape: {joint_q_np.shape}")
+
+        wp.copy(joint_q, wp.array(joint_q_np, dtype=wp.float32))
+        return joint_q_np
+
     def _build_target_mapping(self, model, skeleton, retargeter_config):
         mapped_joints = []
         mapped_joint_indices = []
@@ -295,7 +373,10 @@ class NewtonPipeline:
         for joint, mapping_data in retargeter_config["ik_map"].items():
             mapped_joints.append(joint)
             mapped_joint_indices.append(skeleton.joint_index(joint))
-            mapped_body_link_pos_data.append((body_names.index(mapping_data['t_body']), mapping_data['t_weight']))
+            mapped_body_link_pos_data.append((
+                body_names.index(mapping_data['t_body']),
+                mapping_data['t_weight'],
+                wp.vec3(*mapping_data.get('t_offset', [0.0, 0.0, 0.0]))))
             mapped_body_link_rot_data.append((body_names.index(mapping_data['r_body']), mapping_data['r_weight']))
 
         return (
@@ -303,6 +384,33 @@ class NewtonPipeline:
             mapped_joint_indices,
             mapped_body_link_pos_data,
             mapped_body_link_rot_data)
+
+    def _build_preferred_joint_pose_arrays(self):
+        target_q = self.ik_model.joint_q.numpy().copy()
+        coord_masks = np.zeros(self.ik_model.joint_coord_count, dtype=np.float32)
+        joint_q_start_np = self.ik_model.joint_q_start.numpy()
+        joint_dof_dim_np = self.ik_model.joint_dof_dim.numpy()
+        body_names = [newton_utils.get_name_from_label(label) for label in self.robot_builder.body_label]
+        body_name_to_idx = {name: idx for idx, name in enumerate(body_names)}
+
+        for pose_name, pose_value in self.preferred_joint_pose.items():
+            body_name = self.preferred_joint_pose_body_map.get(pose_name, pose_name)
+            if body_name not in body_name_to_idx:
+                raise ValueError(
+                    f"[ERROR]: Preferred joint pose entry '{pose_name}' maps to unknown body '{body_name}'.")
+            body_idx = body_name_to_idx[body_name]
+            coord_start = int(joint_q_start_np[body_idx])
+            lin_dim, ang_dim = joint_dof_dim_np[body_idx]
+            coord_dim = int(lin_dim + ang_dim)
+            if coord_dim != 1:
+                raise ValueError(
+                    f"[ERROR]: Preferred joint pose entry '{pose_name}' maps to body '{body_name}' "
+                    f"with {coord_dim} coordinates; only 1-DoF joints are supported.")
+
+            target_q[coord_start] = pose_value
+            coord_masks[coord_start] = 1.0
+
+        return target_q, coord_masks
 
     def _create_ik_objectives(self, num_envs, model, state):
         newton.eval_fk(model, model.joint_q, model.joint_qd, state)
@@ -317,7 +425,7 @@ class NewtonPipeline:
         body_q = state.body_q.numpy()
         for env in range(num_envs):
             base = env * self.num_body_count
-            for ee_idx, (link_idx, _) in enumerate(self.mapped_body_link_pos_data):
+            for ee_idx, (link_idx, _, link_offset) in enumerate(self.mapped_body_link_pos_data):
                 pos_targets[env, ee_idx] = body_q[base + link_idx][0:3]
 
             for ee_idx, (link_idx, _) in enumerate(self.mapped_body_link_rot_data):
@@ -336,10 +444,10 @@ class NewtonPipeline:
             rot_target_arrays.append(rot_wp)
 
         position_objectives = []
-        for i, (link_idx, w) in enumerate(self.mapped_body_link_pos_data):
+        for i, (link_idx, w, link_offset) in enumerate(self.mapped_body_link_pos_data):
             objective = ik.IKObjectivePosition(
                 link_index=link_idx,
-                link_offset=wp.vec3(0.0, 0.0, 0.0),
+                link_offset=link_offset,
                 target_positions=pos_target_arrays[i],
                 weight=w)
             position_objectives.append(objective)
@@ -365,4 +473,17 @@ class NewtonPipeline:
             weight=0.0,
             coord_masks=self.smooth_joint_filter_coord_masks)
 
-        return position_objectives, rotation_objectives, joint_limit_objective, smooth_joint_limiter_objective
+        preferred_joint_pose_objective = None
+        if self.preferred_joint_pose_target is not None and self.preferred_joint_pose_coord_masks is not None:
+            preferred_joint_pose_objective = IKJointPosePreference(
+                target_q=self.preferred_joint_pose_target,
+                coord_masks=self.preferred_joint_pose_coord_masks,
+                n_dofs=self.ik_model.joint_dof_count,
+                weight=self.preferred_joint_pose_weight)
+
+        return (
+            position_objectives,
+            rotation_objectives,
+            joint_limit_objective,
+            smooth_joint_limiter_objective,
+            preferred_joint_pose_objective)

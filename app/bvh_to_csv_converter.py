@@ -12,6 +12,7 @@ import soma_retargeter.utils.math_utils as math_utils
 import soma_retargeter.assets.bvh as bvh_utils
 import soma_retargeter.assets.csv as csv_utils
 import soma_retargeter.utils.io_utils as io_utils
+import soma_retargeter.utils.newton_utils as newton_utils
 import soma_retargeter.pipelines.utils as pipeline_utils
 
 from soma_retargeter.renderers.skeleton_renderer import SkeletonRenderer
@@ -50,7 +51,7 @@ class Viewer:
         self.playback_total_time = 0.0
 
         self.retarget_source_options = ['soma']
-        self.retarget_target_options = ['unitree_g1', 'h2']
+        self.retarget_target_options = ['unitree_g1', 'h2', 't1']
         self.retarget_solver_options = ['Newton']
         self.retarget_solver_idx     = 0
         self.retarget_target_idx     = self.retarget_target_options.index(self.current_target)
@@ -64,9 +65,13 @@ class Viewer:
         self.viewer.renderer.set_title("BVH to CSV Converter")
         self.viewer.register_ui_callback(lambda ui: self.gui(ui), position="free")
 
+        target_type = pipeline_utils.get_target_type_from_str(self.current_target)
+        retargeter_config = pipeline_utils.get_retargeter_config(
+            pipeline_utils.get_source_type_from_str(self.config['retarget_source']),
+            target_type)
+
         robot_builder = newton.ModelBuilder()
-        robot_builder.add_mjcf(
-            pipeline_utils.get_robot_mjcf_path(pipeline_utils.get_target_type_from_str(self.current_target)))
+        robot_builder.add_mjcf(pipeline_utils.get_robot_mjcf_path(target_type))
         
         self.num_robots = 1
         self.robot_offsets = [wp.transform(wp.vec3(0.0, i - (self.num_robots - 1) / 2.0, 0.0), wp.quat_identity()) for i in range(self.num_robots)]
@@ -82,6 +87,12 @@ class Viewer:
 
         self.robot_num_joint_q = self.model.joint_coord_count // self.model.articulation_count
         self.robot_joint_q_offsets = [int(i * self.robot_num_joint_q) for i in range(self.model.articulation_count)]
+        newton_utils.apply_default_joint_pose(
+            self.model,
+            robot_builder,
+            retargeter_config.get('default_joint_pose', {}),
+            retargeter_config.get('default_joint_pose_body_map', {}),
+            self.num_robots)
         self.robot_default_joint_q_values = self.model.joint_q.numpy()
 
         self.coordinate_renderer = CoordinateRenderer()

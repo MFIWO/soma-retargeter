@@ -97,11 +97,38 @@ class H231DOF_CSVConfig:
         return UnitreeG129DOF_CSVConfig.to_csv_row(self, frame_idx, anim_row)
 
 
+@dataclass
+class T123DOF_CSVConfig:
+    name: str = "t1_23dof"
+    csv_header: ClassVar[List[str]] = [
+        "Frame",
+        "root_translateX", "root_translateY", "root_translateZ",
+        "root_rotateX", "root_rotateY", "root_rotateZ",
+        "AAHead_yaw_dof", "Head_pitch_dof",
+        "Left_Shoulder_Pitch_dof", "Left_Shoulder_Roll_dof",
+        "Left_Elbow_Pitch_dof", "Left_Elbow_Yaw_dof",
+        "Right_Shoulder_Pitch_dof", "Right_Shoulder_Roll_dof",
+        "Right_Elbow_Pitch_dof", "Right_Elbow_Yaw_dof",
+        "Waist_dof",
+        "Left_Hip_Pitch_dof", "Left_Hip_Roll_dof", "Left_Hip_Yaw_dof",
+        "Left_Knee_Pitch_dof", "Left_Ankle_Pitch_dof", "Left_Ankle_Roll_dof",
+        "Right_Hip_Pitch_dof", "Right_Hip_Roll_dof", "Right_Hip_Yaw_dof",
+        "Right_Knee_Pitch_dof", "Right_Ankle_Pitch_dof", "Right_Ankle_Roll_dof"]
+
+    def to_anim_frame(self, csv_row: np.ndarray) -> np.ndarray:
+        return UnitreeG129DOF_CSVConfig.to_anim_frame(self, csv_row)
+
+    def to_csv_row(self, frame_idx: int, anim_row: np.ndarray) -> List[float]:
+        return UnitreeG129DOF_CSVConfig.to_csv_row(self, frame_idx, anim_row)
+
+
 def get_csv_config(robot_type: str) -> RobotCSVConfig:
     if robot_type == "unitree_g1":
         return UnitreeG129DOF_CSVConfig()
     if robot_type == "h2":
         return H231DOF_CSVConfig()
+    if robot_type == "t1":
+        return T123DOF_CSVConfig()
 
     raise ValueError(f"[ERROR]: Unsupported CSV config for robot type [{robot_type}]")
 
