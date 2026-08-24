@@ -29,10 +29,29 @@ _UI_NEWTON_PANEL_ALPHA  = 0.9
 _DEFAULT_COLOR = (235.0 / 255.0, 245.0 / 255.0, 112.0 / 255.0)
 
 class Viewer:
-    def __init__(self, viewer, config):
+    def __init__(
+            self,
+            viewer,
+            config,
+            *,
+            num_shards=1,
+            shard_index=0,
+            batch_size_override=None):
         self.viewer = viewer
         self.viewer.vsync = True
         self.config = config
+        self.num_shards = int(num_shards)
+        self.shard_index = int(shard_index)
+        if self.num_shards < 1:
+            raise ValueError("num_shards must be at least 1")
+        if self.shard_index < 0 or self.shard_index >= self.num_shards:
+            raise ValueError(
+                f"shard_index must be in [0, {self.num_shards}), "
+                f"got {self.shard_index}")
+        self.batch_size_override = (
+            None if batch_size_override is None else int(batch_size_override))
+        if self.batch_size_override is not None and self.batch_size_override < 1:
+            raise ValueError("batch_size_override must be at least 1")
         self.converter = SpaceConverter(get_facing_direction_type_from_str(self.config['retarget_source_facing_direction']))
 
         if isinstance(self.viewer, newton.viewer.ViewerNull):
@@ -508,15 +527,29 @@ class Viewer:
             print(f"[WARNING]: Export folder does not exist! Creating new folder at {str(export_path)}!")
             export_path.mkdir(parents=True, exist_ok=True)
 
-        batch_size = self.config['batch_size']
-        all_bvh_files = list(import_path.rglob("*.bvh"))
+        batch_size = (
+            self.config['batch_size']
+            if self.batch_size_override is None
+            else self.batch_size_override)
+        # Shard the stable complete input set before checking existing output.
+        # This keeps assignments disjoint even when peer processes begin
+        # exporting CSV files while another shard is still starting up.
+        all_bvh_files = sorted(
+            import_path.rglob("*.bvh"),
+            key=lambda path: path.relative_to(import_path).as_posix())
         if (len(all_bvh_files) == 0):
             print(f"[ERROR]: Import folder {str(import_path)}, does not contain any BVH files.")
             exit(-1)
 
+        shard_bvh_files = all_bvh_files[self.shard_index::self.num_shards]
+        print(
+            f"[INFO]: Shard {self.shard_index}/{self.num_shards}: "
+            f"assigned {len(shard_bvh_files)} of {len(all_bvh_files)} BVH files; "
+            f"batch_size={batch_size}.")
+
         pending_bvh_files = []
         skipped_existing = 0
-        for file_path in all_bvh_files:
+        for file_path in shard_bvh_files:
             dst_path = export_path / file_path.relative_to(import_path).with_suffix(".csv")
             if dst_path.is_file():
                 skipped_existing += 1
@@ -524,13 +557,17 @@ class Viewer:
             pending_bvh_files.append(file_path)
 
         print(f"[INFO]: Found {len(all_bvh_files)} BVH files in total.")
-        print(f"[INFO]: Skipping {skipped_existing} motions with existing CSV outputs.")
+        print(
+            f"[INFO]: Shard {self.shard_index}/{self.num_shards} is skipping "
+            f"{skipped_existing} motions with existing CSV outputs.")
 
         if len(pending_bvh_files) == 0:
             print("[INFO]: No pending BVH files to retarget. Export folder is already up to date.")
             return
 
-        print(f"[INFO]: Retargeting {len(pending_bvh_files)} pending motions.")
+        print(
+            f"[INFO]: Shard {self.shard_index}/{self.num_shards} is retargeting "
+            f"{len(pending_bvh_files)} pending motions.")
 
         # Sort files based on size (largest first)
         pending_bvh_files.sort(key=lambda p: p.stat().st_size, reverse=True)
@@ -619,7 +656,11 @@ class Viewer:
             f"[INFO]: Retargeted {nb_retargeted_motions} animations successfully "
             f"in {elapsed_str} "
             f"[{(elapsed_time/nb_retargeted_motions):.2f}s per motion]!")
-        print(f"[INFO]: Resume summary: total={len(all_bvh_files)}, skipped_existing={skipped_existing}, newly_exported={nb_retargeted_motions}.")
+        print(
+            f"[INFO]: Resume summary: shard={self.shard_index}/{self.num_shards}, "
+            f"global_total={len(all_bvh_files)}, assigned={len(shard_bvh_files)}, "
+            f"skipped_existing={skipped_existing}, "
+            f"newly_exported={nb_retargeted_motions}.")
 
 def main():
     import newton.examples
@@ -631,6 +672,21 @@ def main():
         type=lambda x: None if x == "None" else str(x),
         default="./assets/default_bvh_to_csv_converter_config.json",
         help="Input json config file.")
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Number of deterministic, disjoint BVH process shards.")
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based shard index handled by this process.")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Optional batch-size override without editing the JSON config.")
 
     viewer, args = newton.examples.init(parser)
     if not pathlib.Path(args.config).exists():
@@ -639,7 +695,12 @@ def main():
 
     config = io_utils.load_json(args.config)
     with wp.ScopedDevice(args.device):
-        app = Viewer(viewer, config)
+        app = Viewer(
+            viewer,
+            config,
+            num_shards=args.num_shards,
+            shard_index=args.shard_index,
+            batch_size_override=args.batch_size)
         if not isinstance(viewer, newton.viewer.ViewerNull):
             app.run()
         else:
