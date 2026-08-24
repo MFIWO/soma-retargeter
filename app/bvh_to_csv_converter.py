@@ -66,7 +66,7 @@ class Viewer:
         self.viewer.register_ui_callback(lambda ui: self.gui(ui), position="free")
 
         target_type = pipeline_utils.get_target_type_from_str(self.current_target)
-        retargeter_config = pipeline_utils.get_retargeter_config(
+        retargeter_config = self.get_retargeter_config(
             pipeline_utils.get_source_type_from_str(self.config['retarget_source']),
             target_type)
 
@@ -104,6 +104,48 @@ class Viewer:
         self.animation_buffers = []
         self.skeleton_instances = []
         self.robot_csv_animation_buffers = [None for _ in range(self.num_robots)]
+
+        preview_bvh = self.config.get('preview_bvh')
+        preview_csv = self.config.get('preview_csv')
+        if preview_bvh:
+            self.load_bvh_file(preview_bvh)
+        if preview_csv:
+            self.load_csv_file(preview_csv)
+        elif preview_bvh and self.config.get('preview_retarget', False):
+            self.retarget_motion()
+
+        robot_preview_offset = self.config.get('preview_robot_offset')
+        if robot_preview_offset:
+            self.robot_offsets = [
+                wp.transform(wp.vec3(*robot_preview_offset), wp.quat_identity())
+                for _ in self.robot_offsets
+            ]
+        animation_preview_offset = self.config.get('preview_animation_offset')
+        if animation_preview_offset:
+            self.animation_offsets = [
+                wp.transform(wp.vec3(*animation_preview_offset), wp.quat_identity())
+                for _ in self.animation_offsets
+            ]
+
+        if 'preview_time_seconds' in self.config:
+            self.playback_time = float(self.config['preview_time_seconds'])
+            self.is_playing = False
+        camera = self.config.get('preview_camera')
+        if camera:
+            self.viewer.set_camera(
+                wp.vec3(*camera['position']),
+                float(camera['pitch']),
+                float(camera['yaw']))
+
+    def get_retargeter_config(self, source_type, target_type):
+        """Load an experiment profile without changing the global robot default."""
+        custom_path = self.config.get('retargeter_config')
+        configured_target = self.config.get(
+            'retarget_target', getattr(self, 'current_target', 'unitree_g1'))
+        target_name = pipeline_utils.get_target_str_from_type(target_type)
+        if custom_path and target_name == configured_target:
+            return io_utils.load_json(custom_path)
+        return pipeline_utils.get_retargeter_config(source_type, target_type)
 
     def gui(self, ui):
         self.ui_playback_controls(ui)
@@ -224,13 +266,52 @@ class Viewer:
         self.viewer.end_frame()
 
     def run(self):
+        rendered_frames = 0
+        screenshot_path = self.config.get('preview_screenshot')
+        screenshot_after = int(self.config.get('preview_screenshot_after_frames', 5))
         while self.viewer.is_running():
             with wp.ScopedTimer("step", active=False):
                 self.step()
             with wp.ScopedTimer("render", active=False):
                 self.render()
 
+            rendered_frames += 1
+            if screenshot_path and rendered_frames >= screenshot_after:
+                self.capture_screenshot(screenshot_path)
+                screenshot_path = None
+                if self.config.get('exit_after_preview_screenshot', False):
+                    break
+
         self.viewer.close()
+
+    def capture_screenshot(self, path):
+        """Capture the resolved GL scene buffer for repeatable visual audits."""
+        import ctypes
+        from PIL import Image
+        from pyglet import gl
+
+        renderer = self.viewer.renderer
+        width = renderer._screen_width
+        height = renderer._screen_height
+        pixels = (gl.GLubyte * (width * height * 3))()
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, renderer._frame_fbo)
+        gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
+        gl.glReadPixels(
+            0,
+            0,
+            width,
+            height,
+            gl.GL_RGB,
+            gl.GL_UNSIGNED_BYTE,
+            ctypes.cast(pixels, ctypes.c_void_p))
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+
+        output_path = pathlib.Path(path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.frombytes('RGB', (width, height), bytes(pixels))
+        image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        image.save(output_path)
+        print(f"[INFO]: Saved GL preview screenshot to {output_path}")
 
     def retarget_motion(self):
         retarget_source = self.retarget_source_options[self.retarget_source_idx]
@@ -239,7 +320,14 @@ class Viewer:
         
         if (retarget_solver == 'Newton'):
             import soma_retargeter.pipelines.newton_pipeline as newton_pipeline
-            pipeline = newton_pipeline.NewtonPipeline(self.skeleton, retarget_source, retarget_target)
+            retarget_config = self.get_retargeter_config(
+                pipeline_utils.get_source_type_from_str(retarget_source),
+                pipeline_utils.get_target_type_from_str(retarget_target))
+            pipeline = newton_pipeline.NewtonPipeline(
+                self.skeleton,
+                retarget_source,
+                retarget_target,
+                retarget_config=retarget_config)
         else:
             raise(ValueError(f"[ERROR]: Unknown retargeter solver [{retarget_solver}"))
         
@@ -461,7 +549,14 @@ class Viewer:
         retarget_pipeline = None
         if (retarget_solver == 'Newton'):
             import soma_retargeter.pipelines.newton_pipeline as newton_pipeline
-            retarget_pipeline = newton_pipeline.NewtonPipeline(bvh_skeleton, retarget_source, retarget_target)
+            retarget_config = self.get_retargeter_config(
+                pipeline_utils.get_source_type_from_str(retarget_source),
+                pipeline_utils.get_target_type_from_str(retarget_target))
+            retarget_pipeline = newton_pipeline.NewtonPipeline(
+                bvh_skeleton,
+                retarget_source,
+                retarget_target,
+                retarget_config=retarget_config)
         if retarget_pipeline is None:
             print(f"[ERROR]: Invalid retarget solver selected [{retarget_solver}]. Use 'Newton'.")
             exit(-1)

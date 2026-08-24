@@ -1,0 +1,10 @@
+{
+    "import_folder": "assets/motions/bvh",
+    "export_folder": "artifacts/t1_balanced_continuous_csv",
+    "batch_size": 1,
+    "retargeter": "Newton",
+    "retarget_source": "soma",
+    "retarget_target": "t1",
+    "retarget_source_facing_direction": "Mujoco",
+    "retargeter_config": "soma_retargeter/configs/t1/soma_to_t1_balanced_retargeter_config.json"
+}

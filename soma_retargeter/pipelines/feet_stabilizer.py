@@ -84,7 +84,14 @@ class FeetStabilizer:
 
             wp.copy(self.joint_q, joint_q)
 
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state)
+        # Evaluate the state copied above, not the model's immutable/default
+        # joint pose. Using ``model.joint_q`` here re-anchors every post-process
+        # solve at the origin and destroys root translation tracking.
+        newton.eval_fk(
+            self.model,
+            self.joint_q.flatten(),
+            self.model.joint_qd,
+            self.state)
 
     def current_state(self):
         """Returns the current joint configuration of the model."""

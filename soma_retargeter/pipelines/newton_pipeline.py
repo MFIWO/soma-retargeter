@@ -5,6 +5,7 @@ import warp as wp
 import numpy as np
 import newton
 import newton.ik as ik
+from scipy.spatial.transform import Rotation
 from tqdm import trange
 
 import soma_retargeter.assets.bvh as bvh_utils
@@ -74,7 +75,10 @@ class NewtonPipeline:
         self.joint_delta_limit_body_map = retargeter_config.get('joint_delta_limit_body_map', {})
         self.preferred_joint_pose = retargeter_config.get('preferred_joint_pose', {})
         self.preferred_joint_pose_body_map = retargeter_config.get('preferred_joint_pose_body_map', {})
+        self.preferred_joint_pose_weights = retargeter_config.get('preferred_joint_pose_weights', {})
         self.preferred_joint_pose_weight = retargeter_config.get('preferred_joint_pose_weight', 0.0)
+        self.retarget_options = retargeter_config.get('retarget_options', {})
+        self.temporal_smoothing = self.retarget_options.get('temporal_smoothing', {})
 
         self.robot_builder = newton.ModelBuilder()
         self.robot_builder.add_mjcf(pipeline_utils.get_robot_mjcf_path(self.target_type))
@@ -161,8 +165,195 @@ class NewtonPipeline:
             self.max_frames = max(self.max_frames, buffer.num_frames)
             buffer_effectors = self.human_robot_scaler.compute_effectors_from_buffer(buffer, scale_animation, offsets[i])
 
-            self.input_targets.append(buffer_effectors[:, self.target_effector_indices, :])
+            targets = np.asarray(
+                buffer_effectors[:, self.target_effector_indices, :],
+                dtype=np.float32).copy()
+            self._apply_target_conditioning(targets)
+            self.input_targets.append(targets)
             self.input_sample_rates.append(buffers[i].sample_rate)
+
+    def _apply_target_conditioning(self, targets: np.ndarray) -> None:
+        """Apply optional, robot-aware conditioning to scaled IK targets in-place."""
+        upper_body = self.retarget_options.get('upper_body', {})
+        limb_lengths = upper_body.get('limb_length_conditioning', {})
+        if limb_lengths.get('enabled', False):
+            length_blend = float(np.clip(limb_lengths.get('blend', 1.0), 0.0, 1.0))
+            for chain_name, chain in limb_lengths.get('chains', {}).items():
+                shoulder_name = chain['shoulder_joint']
+                elbow_name = chain['elbow_joint']
+                hand_name = chain['hand_joint']
+                missing = [
+                    name for name in (shoulder_name, elbow_name, hand_name)
+                    if name not in self.mapped_joints
+                ]
+                if missing:
+                    raise ValueError(
+                        f"[ERROR]: Upper-body chain '{chain_name}' references "
+                        f"joints missing from ik_map: {missing}.")
+
+                shoulder_idx = self.mapped_joints.index(shoulder_name)
+                elbow_idx = self.mapped_joints.index(elbow_name)
+                hand_idx = self.mapped_joints.index(hand_name)
+                shoulder = targets[:, shoulder_idx, 0:3]
+                old_elbow = targets[:, elbow_idx, 0:3].copy()
+                old_hand = targets[:, hand_idx, 0:3].copy()
+
+                upper_length = float(chain['upper_arm_length_m'])
+                forearm_length = float(chain['forearm_length_m'])
+                hand_axis = old_hand - shoulder
+                old_hand_distance = np.linalg.norm(
+                    hand_axis, axis=1, keepdims=True)
+                hand_axis /= np.maximum(old_hand_distance, 1.0e-6)
+
+                # Keeping a robot arm exactly at maximum reach makes the elbow
+                # plane under-determined. A tiny amount of target noise can then
+                # select the opposite IK branch and visibly flip the arm. Keep a
+                # configurable bend margin and reconstruct the elbow from the
+                # source elbow plane instead.
+                maximum_reach_ratio = float(np.clip(
+                    chain.get('maximum_reach_ratio', 0.94), 0.5, 0.999))
+                minimum_reach = abs(upper_length - forearm_length) + 1.0e-4
+                maximum_reach = (upper_length + forearm_length) * maximum_reach_ratio
+                conditioned_distance = np.clip(
+                    old_hand_distance, minimum_reach, maximum_reach)
+                conditioned_hand = shoulder + hand_axis * conditioned_distance
+
+                elbow_plane = old_elbow - shoulder
+                elbow_plane -= hand_axis * np.sum(
+                    elbow_plane * hand_axis, axis=1, keepdims=True)
+                elbow_plane_norm = np.linalg.norm(
+                    elbow_plane, axis=1, keepdims=True)
+                bend_directions = np.zeros_like(elbow_plane)
+                bend_alpha = float(np.clip(
+                    chain.get('bend_direction_smoothing', 0.25), 0.0, 1.0))
+                previous_bend = None
+                for frame_idx in range(len(bend_directions)):
+                    if elbow_plane_norm[frame_idx, 0] > 1.0e-5:
+                        candidate = elbow_plane[frame_idx] / elbow_plane_norm[frame_idx, 0]
+                    elif previous_bend is not None:
+                        candidate = previous_bend
+                    else:
+                        fallback = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                        fallback -= hand_axis[frame_idx] * np.dot(
+                            fallback, hand_axis[frame_idx])
+                        if np.linalg.norm(fallback) <= 1.0e-5:
+                            fallback = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+                            fallback -= hand_axis[frame_idx] * np.dot(
+                                fallback, hand_axis[frame_idx])
+                        candidate = fallback / max(np.linalg.norm(fallback), 1.0e-6)
+
+                    if previous_bend is not None:
+                        if np.dot(candidate, previous_bend) < 0.0:
+                            candidate = -candidate
+                        candidate = (
+                            previous_bend * (1.0 - bend_alpha)
+                            + candidate * bend_alpha)
+                        candidate /= max(np.linalg.norm(candidate), 1.0e-6)
+                    bend_directions[frame_idx] = candidate
+                    previous_bend = candidate
+
+                distance = conditioned_distance[:, 0]
+                along_axis = (
+                    upper_length * upper_length
+                    - forearm_length * forearm_length
+                    + distance * distance) / np.maximum(2.0 * distance, 1.0e-6)
+                bend_radius = np.sqrt(np.maximum(
+                    upper_length * upper_length - along_axis * along_axis, 0.0))
+                conditioned_elbow = (
+                    shoulder
+                    + hand_axis * along_axis[:, None]
+                    + bend_directions * bend_radius[:, None])
+
+                new_elbow = (
+                    old_elbow * (1.0 - length_blend)
+                    + conditioned_elbow * length_blend)
+                new_hand = (
+                    old_hand * (1.0 - length_blend)
+                    + conditioned_hand * length_blend)
+
+                targets[:, elbow_idx, 0:3] = new_elbow.astype(np.float32)
+                targets[:, hand_idx, 0:3] = new_hand.astype(np.float32)
+
+        lower_body = self.retarget_options.get('lower_body', {})
+        foot_heading = lower_body.get('foot_heading', {})
+        if not foot_heading.get('enabled', False):
+            return
+
+        reference_name = foot_heading.get('reference_joint', 'Hips')
+        if reference_name not in self.mapped_joints:
+            raise ValueError(
+                f"[ERROR]: Foot-heading reference joint '{reference_name}' is not in ik_map.")
+
+        reference_idx = self.mapped_joints.index(reference_name)
+        reference_rot = Rotation.from_quat(targets[:, reference_idx, 3:7])
+        target_yaws = foot_heading.get('target_relative_yaw_degrees', {})
+        toe_joints = foot_heading.get('toe_joints', {})
+        blend = float(np.clip(foot_heading.get('blend', 1.0), 0.0, 1.0))
+        max_correction = np.deg2rad(float(foot_heading.get('max_correction_degrees', 180.0)))
+        foot_names = foot_heading.get('foot_joints', ['LeftFoot', 'RightFoot'])
+        missing_feet = [name for name in foot_names if name not in self.mapped_joints]
+        if missing_feet:
+            raise ValueError(
+                f"[ERROR]: Foot-heading joints missing from ik_map: {missing_feet}.")
+
+        stance_flattening = lower_body.get('stance_flattening', {})
+        lowest_foot_z = np.min(
+            np.stack([
+                targets[:, self.mapped_joints.index(name), 2]
+                for name in foot_names
+            ], axis=1),
+            axis=1)
+
+        for foot_name in foot_names:
+            foot_idx = self.mapped_joints.index(foot_name)
+            old_foot_rot = Rotation.from_quat(targets[:, foot_idx, 3:7])
+            relative_rot = reference_rot.inv() * old_foot_rot
+            relative_euler = relative_rot.as_euler('xyz', degrees=False)
+            old_yaw = relative_euler[:, 2]
+            target_yaw = np.deg2rad(float(target_yaws.get(foot_name, 0.0)))
+            correction = np.arctan2(
+                np.sin(target_yaw - old_yaw),
+                np.cos(target_yaw - old_yaw))
+            correction = np.clip(correction, -max_correction, max_correction)
+            relative_euler[:, 2] = old_yaw + blend * correction
+            new_foot_rot = reference_rot * Rotation.from_euler('xyz', relative_euler)
+
+            if stance_flattening.get('enabled', False):
+                flatten_height = max(
+                    float(stance_flattening.get('height_above_lowest_m', 0.025)),
+                    1.0e-6)
+                relative_height = np.maximum(
+                    targets[:, foot_idx, 2] - lowest_foot_z, 0.0)
+                stance_weight = np.clip(
+                    1.0 - relative_height / flatten_height, 0.0, 1.0)
+                # Smoothstep removes the binary rotation jump at the contact
+                # classification boundary while retaining a flat lowest foot.
+                stance_weight = stance_weight * stance_weight * (3.0 - 2.0 * stance_weight)
+                flatten_blend = float(np.clip(
+                    stance_flattening.get('blend', 1.0), 0.0, 1.0))
+                world_euler = new_foot_rot.as_euler('xyz', degrees=False)
+                world_euler[:, 0:2] *= (
+                    1.0 - flatten_blend * stance_weight[:, None])
+                new_foot_rot = Rotation.from_euler('xyz', world_euler)
+
+            targets[:, foot_idx, 3:7] = new_foot_rot.as_quat().astype(np.float32)
+
+            toe_name = toe_joints.get(foot_name)
+            if toe_name is None:
+                continue
+            if toe_name not in self.mapped_joints:
+                raise ValueError(
+                    f"[ERROR]: Toe-heading joint '{toe_name}' is not in ik_map.")
+
+            # Rotate the foot-to-toe segment by the same orientation correction.
+            # This keeps the virtual toe positional objective consistent with the
+            # conditioned foot rotation objective.
+            toe_idx = self.mapped_joints.index(toe_name)
+            foot_to_toe_world = targets[:, toe_idx, 0:3] - targets[:, foot_idx, 0:3]
+            foot_to_toe_local = old_foot_rot.inv().apply(foot_to_toe_world)
+            targets[:, toe_idx, 0:3] = (
+                targets[:, foot_idx, 0:3] + new_foot_rot.apply(foot_to_toe_local)
+            ).astype(np.float32)
 
     def execute(self):
         """
@@ -197,6 +388,9 @@ class NewtonPipeline:
         print(f"[INFO]\t  Default Joint Pose Entries: {len(self.default_joint_pose)}")
         print(f"[INFO]\t  Joint Delta Limit Entries: {len(self.joint_delta_limits)}")
         print(f"[INFO]\t  Preferred Joint Pose Entries: {len(self.preferred_joint_pose)}")
+        foot_heading = self.retarget_options.get('lower_body', {}).get('foot_heading', {})
+        print(f"[INFO]\t  Foot Heading Conditioning: {foot_heading.get('enabled', False)}")
+        print(f"[INFO]\t  Temporal Smoothing: {self.temporal_smoothing.get('enabled', False)}")
 
         model = self._build_model(num_envs)
         self._apply_default_joint_pose(model, num_envs)
@@ -291,14 +485,94 @@ class NewtonPipeline:
                 if frame > (len(self.input_targets[env])-1):
                     continue
 
-                joint_q_data[env][frame] = data[env]
+                # ``WarpArray.numpy()`` may expose storage reused by the next
+                # frame. Keep an owned snapshot or every CSV row can collapse
+                # to the final solved pose on the CPU execution path.
+                joint_q_data[env][frame] = data[env].copy()
 
             #end_time = time.time()
             #print(f"Time taken for frame {frame}: {end_time - start_time} seconds")
 
-        return [
-            CSVAnimationBuffer.create_from_raw_data(joint_q_data[i][num_frames_to_remove:], self.input_sample_rates[i])
-            for i in range(num_envs)]
+        output_buffers = []
+        for env in range(num_envs):
+            raw_motion = np.stack(
+                joint_q_data[env][num_frames_to_remove:]).astype(np.float32)
+            raw_motion = self._apply_temporal_smoothing(
+                raw_motion, self.input_sample_rates[env])
+            output_buffers.append(CSVAnimationBuffer.create_from_raw_data(
+                raw_motion, self.input_sample_rates[env]))
+        return output_buffers
+
+    def _apply_temporal_smoothing(
+            self, raw_motion: np.ndarray, sample_rate: float) -> np.ndarray:
+        """Remove isolated IK branch spikes without adding causal playback lag.
+
+        Retargeting is an offline operation, so a zero-phase filter can smooth
+        both sides of a discontinuity while keeping events aligned with the BVH.
+        Quaternion signs are made continuous before filtering and normalized
+        afterwards. Joint limits are re-applied to guard against filter overshoot.
+        """
+        config = self.temporal_smoothing
+        if not config.get('enabled', False) or len(raw_motion) < 5:
+            return raw_motion
+
+        from scipy.ndimage import median_filter
+        from scipy.signal import butter, sosfiltfilt
+
+        sample_rate = float(sample_rate)
+        nyquist = 0.5 * sample_rate
+        filter_order = max(1, int(config.get('filter_order', 4)))
+
+        def low_pass(values: np.ndarray, cutoff_hz: float) -> np.ndarray:
+            cutoff_hz = float(cutoff_hz)
+            if cutoff_hz <= 0.0 or cutoff_hz >= nyquist:
+                return values.copy()
+            sos = butter(
+                filter_order,
+                cutoff_hz / nyquist,
+                btype='lowpass',
+                output='sos')
+            try:
+                return sosfiltfilt(sos, values, axis=0)
+            except ValueError:
+                # Very short clips may be shorter than scipy's padding. They
+                # still retain the median cleanup below.
+                return values.copy()
+
+        output = raw_motion.astype(np.float64, copy=True)
+        output[:, 0:3] = low_pass(
+            output[:, 0:3],
+            config.get('root_translation_cutoff_hz', 8.0))
+
+        quaternion = output[:, 3:7].copy()
+        for frame_idx in range(1, len(quaternion)):
+            if np.dot(quaternion[frame_idx - 1], quaternion[frame_idx]) < 0.0:
+                quaternion[frame_idx] *= -1.0
+        quaternion = low_pass(
+            quaternion,
+            config.get('root_rotation_cutoff_hz', 8.0))
+        quaternion /= np.maximum(
+            np.linalg.norm(quaternion, axis=1, keepdims=True), 1.0e-8)
+        output[:, 3:7] = quaternion
+
+        joints = output[:, 7:]
+        median_kernel = max(1, int(config.get('median_kernel_size', 5)))
+        if median_kernel % 2 == 0:
+            median_kernel += 1
+        if median_kernel > 1:
+            joints = median_filter(
+                joints,
+                size=(median_kernel, 1),
+                mode='nearest')
+        output[:, 7:] = low_pass(
+            joints,
+            config.get('joint_cutoff_hz', 8.0))
+
+        filtered = wp.array(output.astype(np.float32), dtype=wp.float32)
+        output = self.joint_limit_clamper.apply(filtered).numpy().copy()
+        output[:, 3:7] /= np.maximum(
+            np.linalg.norm(output[:, 3:7], axis=1, keepdims=True), 1.0e-8)
+        return output.astype(np.float32)
 
     def _build_model(self, num_envs: int):
         builder = newton.ModelBuilder()
@@ -408,7 +682,7 @@ class NewtonPipeline:
                     f"with {coord_dim} coordinates; only 1-DoF joints are supported.")
 
             target_q[coord_start] = pose_value
-            coord_masks[coord_start] = 1.0
+            coord_masks[coord_start] = float(self.preferred_joint_pose_weights.get(pose_name, 1.0))
 
         return target_q, coord_masks
 

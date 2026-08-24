@@ -1,0 +1,10 @@
+{
+    "import_folder": "/home/kimm/Downloads/bones-seed/soma_uniform/bvh",
+    "export_folder": "/home/kimm/Downloads/GR00T-WholeBodyControl/data/t1_bones_seed_csv",
+    "batch_size": 512,
+    "retargeter": "Newton",
+    "retarget_source": "soma",
+    "retarget_target": "t1",
+    "retarget_source_facing_direction": "Mujoco",
+    "retargeter_config": "soma_retargeter/configs/t1/soma_to_t1_balanced_retargeter_config.json"
+}

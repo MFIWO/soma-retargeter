@@ -107,6 +107,47 @@ python ./app/bvh_to_csv_converter.py --config ./assets/default_bvh_to_csv_conver
 
 Batch mode recursively finds all `.bvh` files in the import folder, processes them in configurable batch sizes, and writes CSV files to the export folder mirroring the input directory structure.
 
+### T1 balanced retargeting
+
+The T1 balanced profile adds pelvis-relative foot heading conditioning, a virtual toe target, continuous stance-foot flattening, robot-length shoulder/elbow/hand targets, elbow-plane branch continuity, and per-joint branch preferences. An optional offline zero-phase temporal pass removes isolated IK/feet-stabilizer spikes without shifting BVH event timing. Run it from the repository root:
+
+```bash
+WARP_CACHE_PATH=/tmp/soma_retarget_warp_cache \
+conda run --no-capture-output -n soma-retargeter \
+python app/bvh_to_csv_converter.py \
+  --config assets/t1_balanced_bvh_to_csv_converter_config.json \
+  --viewer null \
+  --device cpu
+```
+
+Audit a paired BVH/CSV with T1 forward kinematics. The report includes contact-foot heading and tilt, stance width, approximate COM support margin, root lean, and shoulder/elbow/hand target errors:
+
+```bash
+WARP_CACHE_PATH=/tmp/soma_retarget_warp_cache \
+conda run --no-capture-output -n soma-retargeter \
+python app/audit_t1_retarget.py \
+  --bvh assets/motions/bvh/wave_R_001__A428.bvh \
+  --csv artifacts/t1_balanced_csv/wave_R_001__A428.csv \
+  --retarget-config soma_retargeter/configs/t1/soma_to_t1_balanced_retargeter_config.json \
+  --output artifacts/t1_balanced_csv/wave_metrics.json
+```
+
+For interactive inspection, add `preview_bvh` and `preview_csv` to a converter config and use `--viewer gl`. Optional `preview_robot_offset`, `preview_animation_offset`, `preview_time_seconds`, `preview_camera`, and `preview_screenshot` fields make side-by-side, repeatable GL checks possible. The `assets/t1_retarget_gl_*.json` examples cover walking, waving, and standing pickup poses.
+
+The continuous Wave and pickup results can be played side-by-side with their source BVHs using:
+
+```bash
+conda run --no-capture-output -n soma-retargeter \
+python app/bvh_to_csv_converter.py \
+  --config assets/t1_retarget_gl_wave_playback.json \
+  --viewer gl \
+  --device cpu
+```
+
+Use `assets/t1_retarget_gl_pickup_playback.json` for the standing pickup motion. The audit report also includes per-joint velocity and acceleration tails, the worst offending joints/frames, and a count of frames above 18 rad/s.
+
+The COM support margin in the audit is a quasi-static geometric diagnostic, not a ZMP, capture-point, or dynamics certificate. Walking, turning, jumping, and dancing CSVs must still pass a physics-based tracking evaluation before they are used for real-robot policy training or deployment.
+
 ## Code Overview
 
 ### `app/`
