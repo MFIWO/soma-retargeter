@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from enum import IntEnum, auto
+import os
 from pathlib import Path
 
 import newton
@@ -21,11 +22,35 @@ class TargetType(IntEnum):
     T1 = auto()
 
 
-import pathlib
+_H2_MJCF_PATH = Path("/root/Downloads/GR00T-WholeBodyControl/gear_sonic/data/assets/robot_description/mjcf/h2.xml")
 
-_H2_MJCF_PATH = pathlib.Path("/root/Downloads/GR00T-WholeBodyControl/gear_sonic/data/assets/robot_description/mjcf/h2.xml")
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
-_T1_MJCF_PATH = _REPO_ROOT / "gear_sonic/data/assets/robot_description/mjcf/T1_23dof.xml"
+
+def _t1_mjcf_candidates() -> tuple[Path, ...]:
+    """Return portable T1 MJCF locations without changing the H2 path."""
+
+    workspace_or_groot = Path(__file__).resolve().parents[3]
+    candidates: list[Path] = []
+    direct_override = os.environ.get("SOMA_T1_MJCF_PATH")
+    if direct_override:
+        candidates.append(Path(direct_override).expanduser())
+    groot_root = os.environ.get("GROOT_WBC_ROOT")
+    if groot_root:
+        candidates.append(
+            Path(groot_root).expanduser()
+            / "gear_sonic/data/assets/robot_description/mjcf/T1_23dof.xml"
+        )
+    # Local development keeps soma-retargeter inside GR00T.  The isolated H100
+    # layout instead keeps both repositories as siblings under workspace/.
+    candidates.extend(
+        (
+            workspace_or_groot
+            / "gear_sonic/data/assets/robot_description/mjcf/T1_23dof.xml",
+            workspace_or_groot
+            / "GR00T-WholeBodyControl-t1-newton"
+            / "gear_sonic/data/assets/robot_description/mjcf/T1_23dof.xml",
+        )
+    )
+    return tuple(path.resolve() for path in candidates)
 
 _SOURCE_TYPE_TO_STR = {
     SourceType.SOMA : "soma"
@@ -170,8 +195,13 @@ def get_robot_mjcf_path(target: TargetType) -> Path:
         return _H2_MJCF_PATH
 
     if target == TargetType.T1:
-        if not _T1_MJCF_PATH.exists():
-            raise FileNotFoundError(f"[ERROR]: T1 MJCF file not found: {_T1_MJCF_PATH}")
-        return _T1_MJCF_PATH
+        candidates = _t1_mjcf_candidates()
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        searched = "\n  - ".join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            "[ERROR]: T1 MJCF file not found. Searched:\n  - " + searched
+        )
 
     raise ValueError(f"Unknown target type [{target}].")
