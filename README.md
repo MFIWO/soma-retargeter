@@ -1,4 +1,7 @@
 # SOMA Retargeter
+
+> **T1 branch guide:** [retarget·검증·학습 인계 문서](docs/t1/README.md) · `t1-retarget-support`
+
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 ![SOMA Retargeter Banner](assets/docs/banner.gif)
@@ -189,3 +192,4 @@ This project draws inspiration and builds upon excellent open-source work, inclu
 This codebase is licensed under [Apache-2.0](LICENSE).
 
 This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.
+
