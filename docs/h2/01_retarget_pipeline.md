@@ -4,6 +4,8 @@
 
 이 문서는 해당 commit의 코드·설정·기존 문서를 대조한 안내서다. 문서 정리 과정에서 PPO, 데이터 변환, GPU 평가 또는 실기 제어를 실행하지 않았다. 아래 명령은 데이터·checkpoint·환경이 준비된 작업용 머신에서 사용하는 템플릿이다. 실행 경로가 존재한다는 것과 학습 성능이 검증됐다는 것은 구분한다.
 
+원본 대비 수치·코드 변경과 사용자 튜닝 경험은 [변경과 시행착오](03_upstream_changes_and_tuning.md)에 정리했다. IK joint filter weight, 시간축 filtering, actuator PD gain을 구분한다.
+
 ## 1. 환경과 asset
 
 ```bash

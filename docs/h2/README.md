@@ -8,6 +8,7 @@
 |---|---|
 | 설치·입력·로봇 설정·CSV 생성 | [retarget pipeline](01_retarget_pipeline.md) |
 | CSV 품질·시간/좌표 계약·학습 인계 | [검증과 training handoff](02_validation_handoff.md) |
+| NVIDIA 원본 대비 변경·팔/손/발목 튜닝 | [변경과 시행착오](03_upstream_changes_and_tuning.md) |
 
 이 브랜치는 `h2-retarget-support`다. `main` 또는 다른 로봇 브랜치와 파일 존재/기능이 다를 수 있다. H2 브랜치에도 초기 T1 등록이 포함되지만 최신 T1 balanced/sharding 구현은 T1 브랜치를 사용한다.
 
