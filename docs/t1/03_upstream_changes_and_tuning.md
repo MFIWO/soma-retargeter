@@ -1,8 +1,10 @@
 # T1 retarget: NVIDIA 원본 대비 변경과 팔·발 보정 기록
 
-작성·소스 대조: 2026-09-17. 사용자 회고의 증상, Git에 남은 변경, 코드로 해석한 작동 원리를 구분한다. 이번 문서화에서 BVH 변환·GPU 학습·실기 검증을 새로 수행하지 않았다.
+문서 개정: 2026-09-22 · 원격 대조: `10f722de85d1b9147d932b19f062758108cbad51`.
 
-## 1. 당시 원본과 최신 원본을 구분한다
+검토 기준일: 2026-09-17. 본 문서는 개발 당시 관찰과 Git의 설정·구현 차이를 근거로 T1 retarget 변경 이력을 정리한다. 실행 명령과 확인 기준은 [T1 retarget 실행 가이드](00_execution_runbook.md)를 참조한다.
+
+## 1. 원본 버전 및 비교 기준
 
 | 기준 | Commit·의미 |
 |---|---|
@@ -10,18 +12,18 @@
 | fork H2 추가 | [`99f166e9`](https://github.com/MFIWO/soma-retargeter/commit/99f166e9045cb2bf52a2bfc1d5cfa89d9cee3f30), 2026-04-25. 위 원본 commit의 직접 자식 |
 | fork T1 추가 | [`b2d7ce7a`](https://github.com/MFIWO/soma-retargeter/commit/b2d7ce7a5584c2bd290042baed83cf0c69256873), 2026-07-27 |
 | balanced T1 | [`aefd449f`](https://github.com/MFIWO/soma-retargeter/commit/aefd449f7b2a5bf27c2bff9ef608051dfa9c330b), 2026-08-24 |
-| 이번 T1 코드 snapshot | [`93cded49`](https://github.com/MFIWO/soma-retargeter/tree/93cded49f8810adc181b1150f65182bb13727cfe), 2026-08-24 |
+| T1 코드 검토 기준 | [`93cded49`](https://github.com/MFIWO/soma-retargeter/tree/93cded49f8810adc181b1150f65182bb13727cfe), 2026-08-24 |
 | 조사 당시 최신 NVIDIA | [`1733b820`](https://github.com/NVIDIA/soma-retargeter/commit/1733b820f3cdf6f74bbc81a10bda3201b38c7bcf), 2026-09-15, SOMA v0.2.0 multi-embodiment release |
 
-원본 v0.1에 BVH/scaling/Newton IK/joint-limit objective/feet stabilization/CSV export 기반이 있었다. fork는 이를 T1의 asset·축·길이·목표에 맞게 확장했다. 최신 v0.2에는 이미 Booster T1과 H2 config가 있으므로 “NVIDIA SOMA는 현재도 G1만 지원한다”고 쓰지 않는다.
+원본 v0.1에 BVH/scaling/Newton IK/joint-limit objective/feet stabilization/CSV export 기반이 있었다. fork는 이를 T1의 asset·축·길이·목표에 맞게 확장했다. 최신 v0.2에는 Booster T1과 H2 config가 포함되어 있으므로, 본 비교의 자체 변경 범위는 당시 사용한 v0.1 기준으로 해석한다.
 
-v0.2의 [T1 설정](https://github.com/NVIDIA/soma-retargeter/blob/1733b820f3cdf6f74bbc81a10bda3201b38c7bcf/soma_retargeter/assets/robotics/booster/t1/configs/soma_to_booster_t1_retargeter_config.json)은 경로·`ik_match_table`·mask 배열 등 schema가 다르다. 여기의 v0.1 fork 수치를 최신 파일에 그대로 덮어쓰면 안 된다. 이번 작업은 최신 버전으로의 migration이나 품질 비교를 실행한 것이 아니다.
+v0.2의 [T1 설정](https://github.com/NVIDIA/soma-retargeter/blob/1733b820f3cdf6f74bbc81a10bda3201b38c7bcf/soma_retargeter/assets/robotics/booster/t1/configs/soma_to_booster_t1_retargeter_config.json)은 경로·`ik_match_table`·mask 배열 등 schema가 다르다. 여기의 v0.1 fork 수치를 최신 파일에 그대로 덮어쓰면 안 된다. v0.2 migration 및 버전 간 품질 비교는 본 검토 범위에 포함되지 않는다.
 
-## 2. 팔이 접히지 않았다는 문제의 증거 범위
+## 2. 초기 팔 굽힘 문제 및 모델 적용 범위
 
-**사용자 회고:** T1 팔 구조가 G1과 달라 G1식 retarget에서 팔이 잘 접히지 않았고, 조정 후 개선됐다. 사용자 표현은 팔당 모터5개였다.
+**초기 관찰(개발 담당자 보고):** G1 기반 retarget 설정을 T1에 적용했을 때 팔 굽힘이 제한되었으며, 후속 설정 조정 후 개선이 관찰되었다.
 
-**코드 확인:** 이 브랜치의 CSV/제어 대상은 23 DoF이고 팔당 shoulder pitch/roll + elbow pitch/yaw 네 축이다. 하드웨어 다섯 번째 모터의 유무·역할·비활성 여부는 이 코드만으로 확정하지 않는다. 현재 문서의 관절 수는 이 제어 모델 기준이다.
+**모델 적용 범위:** 이 branch의 CSV/제어 대상은 23 DoF이며 팔당 shoulder pitch/roll 및 elbow pitch/yaw 네 축이다. 하드웨어 전체 모터 수와 policy 활성 제어 축은 별도 항목으로 관리하고 실제 기체 버전과 대조한다.
 
 아래 수정들은 팔의 불충분한 굽힘·목표 도달·IK branch 불안정과 관련된 구현이다. 다만 같은 BVH의 수정 전후 영상·정량 ablation이 commit에 함께 있지 않아 **어느 한 값이 당시 증상을 해결한 유일한 원인**이라고 확정하지 않는다.
 
@@ -48,9 +50,9 @@ v0.2의 [T1 설정](https://github.com/NVIDIA/soma-retargeter/blob/1733b820f3cdf
 
 정확한 소스 링크: [초기 config](../../soma_retargeter/configs/t1/soma_to_t1_retargeter_config.json), [balanced config](../../soma_retargeter/configs/t1/soma_to_t1_balanced_retargeter_config.json), [scaler](../../soma_retargeter/configs/t1/soma_to_t1_scaler_config.json).
 
-## 4. '부드럽게 하는 gain' 세 종류를 섞지 않는다
+## 4. 관절 penalty·변화량 제한·시간축 필터의 구분
 
-[원본 IKSmoothJointFilter](https://github.com/NVIDIA/soma-retargeter/blob/b3ef2708d84bfd1314ddb52d0db6c9c211df1f57/soma_retargeter/pipelines/ik_objectives.py)는 현재 joint 좌표와 관절 범위를 이용한 nonlinear penalty다. residual에 이전 frame의 `q`를 빼는 항은 없다. 따라서 `smooth_joint_filter_weight=35`를 “35 Hz low-pass”나 “관절 속도 smoothing gain”으로 설명하면 잘못이다.
+[원본 IKSmoothJointFilter](https://github.com/NVIDIA/soma-retargeter/blob/b3ef2708d84bfd1314ddb52d0db6c9c211df1f57/soma_retargeter/pipelines/ik_objectives.py)는 현재 joint 좌표와 관절 범위를 이용한 nonlinear penalty다. residual에 이전 frame의 `q`를 빼는 항은 없다. `smooth_joint_filter_weight=35`는 해당 IK penalty의 가중치다. 시간축 cutoff나 관절 속도 smoothing 계수와는 구분한다.
 
 | 제어 장치 | 실제 역할 | T1에서의 사용 |
 |---|---|---|
@@ -60,7 +62,7 @@ v0.2의 [T1 설정](https://github.com/NVIDIA/soma-retargeter/blob/1733b820f3cdf
 
 frame 단위 증분 제한은 FPS를 바꾸면 초당 허용 속도도 달라진다. 8 Hz filtering은 offline `sosfiltfilt`이며 실시간 causal filter가 아니다. root quaternion 부호 연속화·정규화와 마지막 joint-limit clamp도 수행한다. 과도한 filtering이 빠른 동작을 둔화할 가능성은 별도 품질 평가 대상이다.
 
-초기 설정의 `Left_Shoulder_Yaw` 이름은 body map에서 `left_hand_link`를 가리킨다. balanced에서는 이를 `Left_Elbow_Yaw`로 명시했다. **이 이름 변경만으로 물리 관절이 새로 생긴 것은 아니다.** default roll은 좌 -1.48/우 +1.48, yaw는 좌 -0.3/우 +0.3; preferred yaw는 -0.4/+0.4로 branch 선택을 보조한다. 관련 구현은 [newton_pipeline.py](../../soma_retargeter/pipelines/newton_pipeline.py), [ik_objectives.py](../../soma_retargeter/pipelines/ik_objectives.py)다.
+초기 설정의 `Left_Shoulder_Yaw` 이름은 body map에서 `left_hand_link`를 가리킨다. balanced에서는 이를 `Left_Elbow_Yaw`로 명시했다. 이는 body map이 가리키는 기존 관절의 설정 키 명칭을 정리한 것으로, 로봇의 DoF 변경은 아니다. default roll은 좌 -1.48/우 +1.48, yaw는 좌 -0.3/우 +0.3; preferred yaw는 -0.4/+0.4로 branch 선택을 보조한다. 관련 구현은 [newton_pipeline.py](../../soma_retargeter/pipelines/newton_pipeline.py), [ik_objectives.py](../../soma_retargeter/pipelines/ik_objectives.py)다.
 
 ## 5. 팔 길이와 굽힘 여유를 직접 넣은 변경
 
@@ -72,11 +74,11 @@ balanced의 `_apply_target_conditioning()`은 단순 전체 키 scaling 뒤에 T
 - source 팔꿈치 plane에서 굽힘 방향을 복원하고, 이전 방향과 부호를 맞춘 뒤 smoothing 0.2 적용.
 - 새 손 거리와 segment 길이로 elbow 위치를 재구성; blend1로 목표에 반영.
 
-코드 주석은 완전 최대 reach에서 elbow plane이 불안정해져 작은 noise에 반대 IK branch로 넘어가는 문제를 설명한다. 94% 제한은 굽힘 여유를 두는 구현상 조치다. “팔이 안 접힘” 회고와 관련성이 있지만 이를 입증한 단독 ablation 결과는 없다.
+코드 주석은 완전 최대 reach에서 elbow plane이 불안정해져 작은 noise에 반대 IK branch로 넘어가는 문제를 설명한다. 94% 제한은 굽힘 여유를 두는 구현상 조치다. 초기 팔 굽힘 문제와의 관련성이 있으나, 개별 조치의 기여도를 분리한 ablation 결과는 확인되지 않았다.
 
-config의 `elbow_position_targets`, `hand_endpoint_targets`, `elbow_yaw_branch_guard` 세 boolean은 확인한 pipeline에서 독립적으로 읽는 switch가 아니다. 실제 작동 경로는 `ik_map`, `limb_length_conditioning.enabled`, preferred pose와 delta limit이다. 세 boolean만 변경하면 기능이 켜지고 꺼진다고 안내하지 않는다.
+config의 `elbow_position_targets`, `hand_endpoint_targets`, `elbow_yaw_branch_guard` 세 boolean은 확인한 pipeline에서 독립적으로 읽는 switch가 아니다. 실제 작동 경로는 `ik_map`, `limb_length_conditioning.enabled`, preferred pose와 delta limit이다. 기능 변경 시에는 실제로 참조되는 설정과 처리 경로를 함께 조정해야 한다.
 
-## 6. 발목·접촉과 CSV 동결 문제까지 함께 보정
+## 6. 발 방향·접촉 보정 및 CSV 저장 안정성
 
 | 변경 | 이유·구현 |
 |---|---|
@@ -87,12 +89,12 @@ config의 `elbow_position_targets`, `hand_endpoint_targets`, `elbow_yaw_branch_g
 | frame snapshot 복사 | `joint_q_data[env][frame] = data[env].copy()`로 CPU Warp 배열 재사용 시 CSV 전 frame이 최종 pose로 같아지는 문제 방지 |
 | 품질 감사 | [audit_t1_retarget.py](../../app/audit_t1_retarget.py): 발 방향·stance·근사 COM·팔 목표 오차·속도/가속도 tail. 근사 COM만으로 동적 안정성을 보장하지 않음 |
 
-마지막 `.copy()` 수정은 관절 gain과 별개의 데이터 저장 오류다. 정적인 CSV를 보고 policy 학습 부족으로 잘못 진단하지 않도록 변경 이력에 함께 남긴다.
+마지막 `.copy()` 수정은 관절 gain과 별개의 데이터 저장 오류다. CSV의 frame 간 변화가 소실되면 reference 데이터 저장 문제와 policy tracking 문제를 분리하여 점검한다.
 
-## 7. 실행·재현성에서 추가한 부분
+## 7. 실행 환경 및 재현성 개선
 
 원본 G1 asset 경로에서 로봇별 MJCF 선택으로 확장했고, T1에는 [격리 workspace asset 해석](https://github.com/MFIWO/soma-retargeter/commit/8ce9740854c6bdf8f5a9f58d3467433c59070f84), [deterministic process sharding](https://github.com/MFIWO/soma-retargeter/commit/93cded49f8810adc181b1150f65182bb13727cfe), balanced override·batch 관련 converter 옵션을 추가했다. 대용량 motion 처리와 품질 보정은 별개의 변화다. shard 재실행의 기존 파일 skip은 config hash나 CSV 무결성 검증까지 대신하지 않는다.
 
 실행 명령과 감사 절차는 [pipeline](01_retarget_pipeline.md), [검증·학습 인계](02_validation_handoff.md)를 따른다. 재현 시 같은 BVH를 G1식 초기값/초기 T1/balanced로 처리하고 elbow ROM, hand endpoint error, limit saturation, 발 미끄러짐·회전, spike를 함께 비교해야 한다. 설정 파일·asset hash·FPS·실패 clip·전후 영상/수치를 남겨야 다음 기체에 실제 튜닝 순서를 넘길 수 있다.
 
-현재 Git은 일부 최종 config와 묶음 commit을 보존한다. 사용자가 시도했던 모든 중간 gain과 당시 성공 clip을 복원할 수 있는 것은 아니다. 이 문서는 확인된 차이까지 기록하고 그 빈칸을 추측으로 채우지 않는다.
+현재 Git에는 최종 config와 기능별 commit이 보존되어 있다. 중간 gain 탐색값 및 동일 clip의 전후 결과가 누락된 구간은 미확인 항목으로 관리한다.
